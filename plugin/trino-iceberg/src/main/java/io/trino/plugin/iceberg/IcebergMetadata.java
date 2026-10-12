@@ -162,9 +162,11 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.DeleteFiles;
+import org.apache.iceberg.ExpireSnapshots;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileMetadata;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.GenericStatisticsFile;
 import org.apache.iceberg.IcebergTransactions;
 import org.apache.iceberg.IsolationLevel;
 import org.apache.iceberg.ManifestFile;
@@ -2482,13 +2484,35 @@ public class IcebergMetadata
                 IcebergConfig.EXPIRE_SNAPSHOTS_MIN_RETENTION,
                 IcebergSessionProperties.EXPIRE_SNAPSHOTS_MIN_RETENTION);
 
+        ExpireSnapshots expireSnapshots = table.expireSnapshots()
+                .expireOlderThan(session.getStart().toEpochMilli() - retention.toMillis())
+                .retainLast(retainLast)
+                .cleanExpiredMetadata(cleanExpiredMetadata)
+                .planWith(icebergScanExecutor);
+
+        if (!isS3Tables(table.location()) && table.currentSnapshot() != null) {
+            long currentSnapshotId = table.currentSnapshot().snapshotId();
+            Optional<StatisticsFile> latestStatisticsFile = TableStatisticsReader.getLatestStatisticsFile(table, currentSnapshotId);
+            if (latestStatisticsFile.isPresent() && latestStatisticsFile.get().snapshotId() != currentSnapshotId) {
+                StatisticsFile source = latestStatisticsFile.get();
+                if (expireSnapshots.apply().stream().anyMatch(snapshot -> snapshot.snapshotId() == source.snapshotId())) {
+                    // Re-register the statistics file on the current snapshot to keep it through expiry of the snapshot it was written for
+                    commitUpdate(
+                            table.updateStatistics()
+                                    .setStatistics(new GenericStatisticsFile(
+                                            currentSnapshotId,
+                                            source.path(),
+                                            source.fileSizeInBytes(),
+                                            source.fileFooterSizeInBytes(),
+                                            source.blobMetadata())),
+                            "retain statistics file");
+                }
+            }
+        }
+
         // ForwardingFileIo handles bulk operations so no separate function implementation is needed
         try {
-            commitUpdate(table.expireSnapshots()
-                    .expireOlderThan(session.getStart().toEpochMilli() - retention.toMillis())
-                    .retainLast(retainLast)
-                    .cleanExpiredMetadata(cleanExpiredMetadata)
-                    .planWith(icebergScanExecutor), "expire snapshots");
+            commitUpdate(expireSnapshots, "expire snapshots");
         }
         catch (NotFoundException e) {
             throw new TrinoException(ICEBERG_INVALID_METADATA, e);
